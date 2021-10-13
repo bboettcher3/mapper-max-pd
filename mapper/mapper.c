@@ -89,6 +89,7 @@ static void mapperobj_anything(t_mapper *x, t_symbol *s, int argc, t_atom *argv)
 static void mapperobj_add_signal(t_mapper *x, t_symbol *s, int argc, t_atom *argv);
 static void mapperobj_remove_signal(t_mapper *x, t_symbol *s, int argc, t_atom *argv);
 static void mapperobj_clear_signals(t_mapper *x, t_symbol *s, int argc, t_atom *argv);
+static void mapperobj_list_devices(t_mapper *x, t_symbol *s, int argc, t_atom *argv);
 
 static void mapperobj_poll(t_mapper *x);
 
@@ -110,6 +111,7 @@ static void mapperobj_read_definition(t_mapper *x);
 static int maxpd_atom_strcmp(t_atom *a, const char *string);
 static const char *maxpd_atom_get_string(t_atom *a);
 static void maxpd_atom_set_string(t_atom *a, const char *string);
+static void maxpd_atom_set_list_item(t_atom* a, const char* string, int idx);
 static void maxpd_atom_set_int(t_atom *a, int i);
 static double maxpd_atom_get_float(t_atom *a);
 static void maxpd_atom_set_float(t_atom *a, float d);
@@ -141,6 +143,7 @@ void ext_main(void *r)
         class_addmethod(c, (method)mapperobj_learn,          "learn",    A_GIMME,    0);
         class_addmethod(c, (method)mapperobj_set,            "set",      A_GIMME,    0);
         class_addmethod(c, (method)mapperobj_clear_signals,  "clear",    A_GIMME,    0);
+        class_addmethod(c, (method)mapperobj_list_devices,   "devices",  A_GIMME,    0);
         class_register(CLASS_BOX, c); /* CLASS_NOBOX */
         mapperobj_class = c;
         return 0;
@@ -151,12 +154,13 @@ void ext_main(void *r)
         t_class *c;
         c = class_new(gensym("mapper"), (t_newmethod)mapperobj_new, (t_method)mapperobj_free,
                       (long)sizeof(t_mapper), 0L, A_GIMME, 0);
-        class_addmethod(c,   (t_method)mapperobj_add_signal,    gensym("add"),    A_GIMME, 0);
-        class_addmethod(c,   (t_method)mapperobj_remove_signal, gensym("remove"), A_GIMME, 0);
+        class_addmethod(c,   (t_method)mapperobj_add_signal,    gensym("add"),     A_GIMME, 0);
+        class_addmethod(c,   (t_method)mapperobj_remove_signal, gensym("remove"),  A_GIMME, 0);
         class_addanything(c, (t_method)mapperobj_anything);
-        class_addmethod(c,   (t_method)mapperobj_learn,         gensym("learn"),  A_GIMME, 0);
-        class_addmethod(c,   (t_method)mapperobj_set,           gensym("set"),    A_GIMME, 0);
-        class_addmethod(c,   (t_method)mapperobj_clear_signals, gensym("clear"),  A_GIMME, 0);
+        class_addmethod(c,   (t_method)mapperobj_learn,         gensym("learn"),   A_GIMME, 0);
+        class_addmethod(c,   (t_method)mapperobj_set,           gensym("set"),     A_GIMME, 0);
+        class_addmethod(c,   (t_method)mapperobj_clear_signals, gensym("clear"),   A_GIMME, 0);
+        class_addmethod(c,   (t_method)mapperobj_list_devices,  gensym("devices"), A_GIMME, 0);
         mapperobj_class = c;
         return 0;
     }
@@ -235,12 +239,12 @@ static void *mapperobj_new(t_symbol *s, int argc, t_atom *argv)
         POST(x, "libmapper version %s – visit libmapper.org for more information.",
              mpr_get_version());
 
-        x->device = mpr_dev_new(x->name, 0);
+        x->graph = mpr_graph_new(MPR_DEV | MPR_SIG);
+        x->device = mpr_dev_new(x->name, x->graph);
         if (!x->device) {
             POST(x, "Error initializing libmapper device.");
             return 0;
         }
-        x->graph = mpr_obj_get_graph(x->device);
         if (iface)
             mpr_graph_set_interface(x->graph, iface);
         POST(x, "Using network interface %s.", mpr_graph_get_interface(x->graph));
@@ -319,9 +323,11 @@ static void mapperobj_free(t_mapper *x)
 #ifdef MAXMSP
     object_free(x->d);          // Frees memory used by dictionary
 #endif
-
     if (x->device) {
         mpr_dev_free(x->device);
+    }
+    if (x->graph) {
+        mpr_graph_free(x->graph);
     }
     if (x->name) {
         free(x->name);
@@ -637,6 +643,35 @@ static void mapperobj_clear_signals(t_mapper *x, t_symbol *s,
     if (dir & MPR_DIR_OUT) {
         maxpd_atom_set_int(x->buffer.atoms, mpr_list_get_size(mpr_dev_get_sigs(x->device, MPR_DIR_OUT)));
         outlet_anything(x->outlet2, gensym("numOutputs"), 1, x->buffer.atoms);
+    }
+}
+
+// *********************************************************
+// -(list all other devices and signals on current interface (excluding this device))-----------------
+// - sends out a stream of: "device <device-name> <sig1> <sig2> <sigN>" for each device
+static void mapperobj_list_devices(t_mapper* x, t_symbol* s,
+    int argc, t_atom* argv)
+{    
+    char* thisDevName = mpr_obj_get_prop_as_str(x->device, MPR_PROP_NAME, NULL);
+    mpr_list devs = mpr_graph_get_list(x->graph, MPR_DEV);
+    while (devs) {        
+        mpr_dev dev = *devs;
+        const char* devName = mpr_obj_get_prop_as_str(dev, MPR_PROP_NAME, NULL);
+        // Skip if is this device
+        if (strcmp(devName, thisDevName) != 0) {
+            int ac = 0; // String count in list
+            maxpd_atom_set_list_item(x->buffer.atoms, devName, ac++);
+            // Make list of signals for each device
+            mpr_list sigs = mpr_dev_get_sigs(dev, MPR_DIR_OUT);
+            while (sigs) {
+                mpr_sig sig = *sigs;
+                const char* sigName = mpr_obj_get_prop_as_str(sig, MPR_PROP_NAME, NULL);
+                maxpd_atom_set_list_item(x->buffer.atoms, sigName, ac++);
+                sigs = mpr_list_get_next(sigs);
+            }
+            outlet_anything(x->outlet2, gensym("device"), ac, x->buffer.atoms);
+        }
+        devs = mpr_list_get_next(devs);
     }
 }
 
@@ -1130,6 +1165,15 @@ static void maxpd_atom_set_string(t_atom *a, const char *string)
     atom_setsym(a, gensym((char *)string));
 #else
     SETSYMBOL(a, gensym(string));
+#endif
+}
+
+static void maxpd_atom_set_list_item(t_atom* a, const char* string, int idx)
+{
+#ifdef MAXMSP
+    atom_setsym(a + idx, gensym((char*)string));
+#else
+    SETSYMBOL(a + idx, gensym(string));
 #endif
 }
 
